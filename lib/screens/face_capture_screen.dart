@@ -1,8 +1,10 @@
 import 'dart:async';
-import 'package:flutter/foundation.dart';
+import 'dart:io';
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
-import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
+import 'package:face_verification/face_verification.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:http/http.dart' as http;
 import 'package:intl/intl.dart';
 import '../api_service.dart';
 import '../constants.dart';
@@ -25,21 +27,71 @@ class _FaceCaptureScreenState extends State<FaceCaptureScreen> {
   static const Color primaryColor = Color(0xFF5B8A72);
 
   CameraController? _cameraController;
-  FaceDetector? _faceDetector;
   bool _isInitialized = false;
   bool _isProcessing = false;
-  bool _faceDetected = false;
-  String _statusMessage = 'Initializing camera...';
-
-  int _countdown = 3;
-  Timer? _countdownTimer;
-  bool _isCapturing = false;
+  String _statusMessage = 'Initializing...';
+  bool _referenceImageReady = false;
+  String? _referenceImagePath;
 
   @override
   void initState() {
     super.initState();
-    _initializeCamera();
-    _initializeFaceDetector();
+    _initialize();
+  }
+
+  Future<void> _initialize() async {
+    await _prepareReferenceImage();
+    await _initializeCamera();
+  }
+
+  Future<void> _prepareReferenceImage() async {
+    setState(() => _statusMessage = 'Preparing verification...');
+
+    final imageUrl = widget.student['image_url'];
+    if (imageUrl == null || imageUrl.toString().isEmpty) {
+      setState(() {
+        _statusMessage = 'No reference image available';
+        _referenceImageReady = false;
+      });
+      return;
+    }
+
+    try {
+      // Download reference image
+      final response = await http.get(Uri.parse(imageUrl));
+      if (response.statusCode != 200) {
+        throw Exception('Failed to download image');
+      }
+
+      // Save to temp file
+      final tempDir = await getTemporaryDirectory();
+      final studentId = widget.student['_id'] ?? 'unknown';
+      final refImagePath = '${tempDir.path}/ref_$studentId.jpg';
+      final refFile = File(refImagePath);
+      await refFile.writeAsBytes(response.bodyBytes);
+
+      // Clear any previous registration for this student
+      await FaceVerification.instance.deleteRecord(studentId);
+
+      // Register the reference face
+      await FaceVerification.instance.registerFromImagePath(
+        id: studentId,
+        imagePath: refImagePath,
+        imageId: 'reference',
+      );
+
+      setState(() {
+        _referenceImagePath = refImagePath;
+        _referenceImageReady = true;
+        _statusMessage = 'Ready to verify';
+      });
+    } catch (e) {
+      print('Error preparing reference image: $e');
+      setState(() {
+        _statusMessage = 'Error loading reference image';
+        _referenceImageReady = false;
+      });
+    }
   }
 
   Future<void> _initializeCamera() async {
@@ -67,9 +119,10 @@ class _FaceCaptureScreenState extends State<FaceCaptureScreen> {
       if (mounted) {
         setState(() {
           _isInitialized = true;
-          _statusMessage = 'Position your face in the frame';
+          if (_referenceImageReady) {
+            _statusMessage = 'Position your face and tap Verify';
+          }
         });
-        _startFaceDetection();
       }
     } catch (e) {
       print('Camera init error: $e');
@@ -77,154 +130,62 @@ class _FaceCaptureScreenState extends State<FaceCaptureScreen> {
     }
   }
 
-  void _initializeFaceDetector() {
-    _faceDetector = FaceDetector(
-      options: FaceDetectorOptions(
-        enableContours: false,
-        enableLandmarks: false,
-        performanceMode: FaceDetectorMode.fast,
-      ),
-    );
-  }
-
-  void _startFaceDetection() {
-    if (_cameraController == null || !_cameraController!.value.isInitialized) {
-      return;
-    }
-
-    _cameraController!.startImageStream((image) async {
-      if (_isProcessing || _isCapturing) return;
-      _isProcessing = true;
-
-      try {
-        final inputImage = _convertCameraImage(image);
-        if (inputImage != null) {
-          final faces = await _faceDetector!.processImage(inputImage);
-
-          if (mounted) {
-            setState(() {
-              _faceDetected = faces.isNotEmpty;
-              if (_faceDetected && !_isCapturing) {
-                _statusMessage = 'Face detected! Hold still...';
-                _startCountdown();
-              } else if (!_faceDetected) {
-                _statusMessage = 'Position your face in the frame';
-                _cancelCountdown();
-              }
-            });
-          }
-        }
-      } catch (e) {
-        print('Face detection error: $e');
-      }
-
-      _isProcessing = false;
-    });
-  }
-
-  InputImage? _convertCameraImage(CameraImage image) {
-    try {
-      final camera = _cameraController!.description;
-      final rotation = InputImageRotationValue.fromRawValue(
-        camera.sensorOrientation,
-      );
-      if (rotation == null) {
-        print('Face detection: rotation is null');
-        return null;
-      }
-
-      final format = InputImageFormatValue.fromRawValue(image.format.raw);
-      if (format == null) {
-        print('Face detection: format is null (raw: ${image.format.raw})');
-        return null;
-      }
-
-      // Concatenate all planes for proper cross-platform support
-      // Android typically uses 1 plane, iOS uses multiple YUV planes
-      final allBytes = WriteBuffer();
-      for (final plane in image.planes) {
-        allBytes.putUint8List(plane.bytes);
-      }
-      final bytes = allBytes.done().buffer.asUint8List();
-
-      return InputImage.fromBytes(
-        bytes: bytes,
-        metadata: InputImageMetadata(
-          size: Size(image.width.toDouble(), image.height.toDouble()),
-          rotation: rotation,
-          format: format,
-          bytesPerRow: image.planes.first.bytesPerRow,
-        ),
-      );
-    } catch (e) {
-      print('Face detection conversion error: $e');
-      return null;
-    }
-  }
-
-  void _startCountdown() {
-    if (_countdownTimer != null || _isCapturing) return;
+  Future<void> _captureAndVerify() async {
+    if (_cameraController == null || _isProcessing) return;
 
     setState(() {
-      _countdown = 3;
-      _isCapturing = true;
+      _isProcessing = true;
+      _statusMessage = 'Capturing...';
     });
-
-    _countdownTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
-      if (_countdown <= 1) {
-        timer.cancel();
-        _countdownTimer = null;
-        _captureAndVerify();
-      } else {
-        setState(() => _countdown--);
-      }
-    });
-  }
-
-  void _cancelCountdown() {
-    _countdownTimer?.cancel();
-    _countdownTimer = null;
-    if (mounted) {
-      setState(() {
-        _isCapturing = false;
-        _countdown = 3;
-      });
-    }
-  }
-
-  Future<void> _captureAndVerify() async {
-    if (_cameraController == null) return;
 
     try {
-      await _cameraController!.stopImageStream();
+      // Capture image
+      final XFile photo = await _cameraController!.takePicture();
 
       setState(() => _statusMessage = 'Verifying face...');
 
-      // For demo: We'll do a simple comparison
-      // In production, this would use face embeddings
-      final hasStudentImage = widget.student['image_url'] != null;
+      // Get student ID
+      final studentId = widget.student['_id'] ?? 'unknown';
 
-      if (!hasStudentImage) {
-        // No reference image - send request to class incharge
-        await _sendAttendanceRequest('No reference image available');
-        return;
+      // Verify the captured face against registered reference
+      final matchId = await FaceVerification.instance.verifyFromImagePath(
+        imagePath: photo.path,
+        threshold: 0.70,
+        staffId: studentId, // Only compare against this specific student
+      );
+
+      if (matchId != null && matchId == studentId) {
+        // Face matched! Mark attendance
+        await _markAttendance();
+      } else {
+        // Face did not match
+        _showResultDialog(
+          false,
+          'Face does not match',
+          'The captured face does not match the registered student photo. Please try again or request manual verification.',
+        );
       }
-
-      // Simulate face matching (in production, use ML model)
-      // For demo, we'll assume face matches if detected
-      await Future.delayed(const Duration(seconds: 1));
-
-      // Mark attendance
-      await _markAttendance();
     } catch (e) {
-      print('Capture error: $e');
-      await _sendAttendanceRequest('Face verification failed');
+      print('Verification error: $e');
+      setState(() => _statusMessage = 'Verification failed');
+      _showResultDialog(
+        false,
+        'Verification Error',
+        'Could not verify face. Please try again or request manual verification.',
+      );
+    } finally {
+      setState(() {
+        _isProcessing = false;
+        if (_referenceImageReady) {
+          _statusMessage = 'Position your face and tap Verify';
+        }
+      });
     }
   }
 
   Future<void> _markAttendance() async {
     final now = DateTime.now();
-    final hour = now.hour >= 9 ? (now.hour - 8) : 1; // Simple hour calc
+    final hour = now.hour >= 9 ? (now.hour - 8) : 1;
 
     final response = await ApiService.post(kCameraAttendance, {
       'student_id': widget.student['_id'],
@@ -235,7 +196,11 @@ class _FaceCaptureScreenState extends State<FaceCaptureScreen> {
 
     if (response != null && response['success'] == true) {
       if (mounted) {
-        _showResultDialog(true, 'Attendance Marked!');
+        _showResultDialog(
+          true,
+          'Attendance Marked!',
+          'Face verified successfully. Attendance has been recorded.',
+        );
       }
     } else {
       await _sendAttendanceRequest('Failed to mark attendance');
@@ -255,11 +220,15 @@ class _FaceCaptureScreenState extends State<FaceCaptureScreen> {
     });
 
     if (mounted) {
-      _showResultDialog(false, 'Request sent to class incharge');
+      _showResultDialog(
+        false,
+        'Request Sent',
+        'Verification request sent to class incharge for approval.',
+      );
     }
   }
 
-  void _showResultDialog(bool success, String message) {
+  void _showResultDialog(bool success, String title, String message) {
     showDialog(
       context: context,
       barrierDismissible: false,
@@ -272,13 +241,13 @@ class _FaceCaptureScreenState extends State<FaceCaptureScreen> {
               height: 80,
               width: 80,
               decoration: BoxDecoration(
-                color: success ? Colors.green.shade50 : Colors.orange.shade50,
+                color: success ? Colors.green.shade50 : Colors.red.shade50,
                 shape: BoxShape.circle,
               ),
               child: Icon(
-                success ? Icons.check_circle : Icons.pending,
+                success ? Icons.check_circle : Icons.error_outline,
                 size: 50,
-                color: success ? Colors.green : Colors.orange,
+                color: success ? Colors.green : Colors.red,
               ),
             ),
             const SizedBox(height: 16),
@@ -288,6 +257,16 @@ class _FaceCaptureScreenState extends State<FaceCaptureScreen> {
               textAlign: TextAlign.center,
             ),
             const SizedBox(height: 8),
+            Text(
+              title,
+              style: TextStyle(
+                fontSize: 16,
+                fontWeight: FontWeight.w600,
+                color: success ? Colors.green : Colors.red,
+              ),
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 4),
             Text(
               message,
               style: TextStyle(fontSize: 14, color: Colors.grey.shade600),
@@ -301,8 +280,10 @@ class _FaceCaptureScreenState extends State<FaceCaptureScreen> {
             child: ElevatedButton(
               onPressed: () {
                 Navigator.of(context).pop();
-                Navigator.of(context).pop();
-                Navigator.of(context).pop();
+                if (success) {
+                  Navigator.of(context).pop();
+                  Navigator.of(context).pop();
+                }
               },
               style: ElevatedButton.styleFrom(
                 backgroundColor: primaryColor,
@@ -310,7 +291,10 @@ class _FaceCaptureScreenState extends State<FaceCaptureScreen> {
                   borderRadius: BorderRadius.circular(8),
                 ),
               ),
-              child: const Text('Done', style: TextStyle(color: Colors.white)),
+              child: Text(
+                success ? 'Done' : 'Try Again',
+                style: const TextStyle(color: Colors.white),
+              ),
             ),
           ),
         ],
@@ -320,9 +304,13 @@ class _FaceCaptureScreenState extends State<FaceCaptureScreen> {
 
   @override
   void dispose() {
-    _countdownTimer?.cancel();
     _cameraController?.dispose();
-    _faceDetector?.close();
+    // Clean up reference image
+    if (_referenceImagePath != null) {
+      File(
+        _referenceImagePath!,
+      ).delete().catchError((_) => File(_referenceImagePath!));
+    }
     super.dispose();
   }
 
@@ -362,7 +350,7 @@ class _FaceCaptureScreenState extends State<FaceCaptureScreen> {
               width: 220,
               decoration: BoxDecoration(
                 border: Border.all(
-                  color: _faceDetected ? Colors.green : Colors.white,
+                  color: _referenceImageReady ? Colors.green : Colors.white,
                   width: 3,
                 ),
                 borderRadius: BorderRadius.circular(120),
@@ -370,30 +358,23 @@ class _FaceCaptureScreenState extends State<FaceCaptureScreen> {
             ),
           ),
 
-          // Countdown
-          if (_isCapturing && _countdown > 0)
+          // Processing Indicator
+          if (_isProcessing)
             Center(
               child: Container(
                 height: 100,
                 width: 100,
-                decoration: BoxDecoration(
+                decoration: const BoxDecoration(
                   color: Colors.black54,
                   shape: BoxShape.circle,
                 ),
-                child: Center(
-                  child: Text(
-                    '$_countdown',
-                    style: const TextStyle(
-                      fontSize: 48,
-                      fontWeight: FontWeight.bold,
-                      color: Colors.white,
-                    ),
-                  ),
+                child: const Center(
+                  child: CircularProgressIndicator(color: Colors.white),
                 ),
               ),
             ),
 
-          // Status Bar
+          // Bottom Controls
           Positioned(
             bottom: 0,
             left: 0,
@@ -414,18 +395,71 @@ class _FaceCaptureScreenState extends State<FaceCaptureScreen> {
                     style: const TextStyle(color: Colors.white, fontSize: 16),
                     textAlign: TextAlign.center,
                   ),
-                  const SizedBox(height: 16),
-                  // Manual Request Button
-                  TextButton(
-                    onPressed: () => _sendAttendanceRequest('Manual request'),
-                    child: const Text(
-                      'Can\'t verify? Send request to teacher',
-                      style: TextStyle(
-                        color: Colors.white70,
-                        decoration: TextDecoration.underline,
+                  const SizedBox(height: 20),
+
+                  // Verify Button
+                  if (_isInitialized && _referenceImageReady && !_isProcessing)
+                    SizedBox(
+                      width: double.infinity,
+                      height: 50,
+                      child: ElevatedButton(
+                        onPressed: _captureAndVerify,
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: primaryColor,
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                        ),
+                        child: const Text(
+                          'Verify Face',
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 18,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
                       ),
                     ),
-                  ),
+
+                  // No reference image - show request button
+                  if (!_referenceImageReady && _isInitialized)
+                    SizedBox(
+                      width: double.infinity,
+                      height: 50,
+                      child: ElevatedButton(
+                        onPressed: () =>
+                            _sendAttendanceRequest('No reference image'),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.orange,
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                        ),
+                        child: const Text(
+                          'Request Manual Verification',
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 16,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ),
+                    ),
+
+                  const SizedBox(height: 12),
+
+                  // Manual Request Button
+                  if (_referenceImageReady)
+                    TextButton(
+                      onPressed: () => _sendAttendanceRequest('Manual request'),
+                      child: const Text(
+                        'Can\'t verify? Send request to teacher',
+                        style: TextStyle(
+                          color: Colors.white70,
+                          decoration: TextDecoration.underline,
+                        ),
+                      ),
+                    ),
                 ],
               ),
             ),
