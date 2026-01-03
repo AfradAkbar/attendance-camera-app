@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'package:flutter/foundation.dart';
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
@@ -127,13 +128,27 @@ class _FaceCaptureScreenState extends State<FaceCaptureScreen> {
       final rotation = InputImageRotationValue.fromRawValue(
         camera.sensorOrientation,
       );
-      if (rotation == null) return null;
+      if (rotation == null) {
+        print('Face detection: rotation is null');
+        return null;
+      }
 
       final format = InputImageFormatValue.fromRawValue(image.format.raw);
-      if (format == null) return null;
+      if (format == null) {
+        print('Face detection: format is null (raw: ${image.format.raw})');
+        return null;
+      }
+
+      // Concatenate all planes for proper cross-platform support
+      // Android typically uses 1 plane, iOS uses multiple YUV planes
+      final allBytes = WriteBuffer();
+      for (final plane in image.planes) {
+        allBytes.putUint8List(plane.bytes);
+      }
+      final bytes = allBytes.done().buffer.asUint8List();
 
       return InputImage.fromBytes(
-        bytes: image.planes.first.bytes,
+        bytes: bytes,
         metadata: InputImageMetadata(
           size: Size(image.width.toDouble(), image.height.toDouble()),
           rotation: rotation,
@@ -142,6 +157,7 @@ class _FaceCaptureScreenState extends State<FaceCaptureScreen> {
         ),
       );
     } catch (e) {
+      print('Face detection conversion error: $e');
       return null;
     }
   }
