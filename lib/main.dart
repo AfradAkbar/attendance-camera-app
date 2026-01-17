@@ -1,14 +1,9 @@
 import 'package:flutter/material.dart';
 import 'screens/batch_select_screen.dart';
 import 'package:google_fonts/google_fonts.dart';
-import 'package:face_verification/face_verification.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-
-  // Initialize face verification model
-  await FaceVerification.instance.init();
-
   runApp(const MyApp());
 }
 

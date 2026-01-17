@@ -24,11 +24,18 @@ class ApiService {
     Map<String, dynamic> body,
   ) async {
     try {
-      final response = await http.post(
-        Uri.parse(url),
-        headers: {'Content-Type': 'application/json'},
-        body: json.encode(body),
-      );
+      final response = await http
+          .post(
+            Uri.parse(url),
+            headers: {'Content-Type': 'application/json'},
+            body: json.encode(body),
+          )
+          .timeout(
+            const Duration(minutes: 2), // Longer timeout for face verification
+            onTimeout: () {
+              throw Exception('Request timed out');
+            },
+          );
 
       return json.decode(response.body);
     } catch (e) {

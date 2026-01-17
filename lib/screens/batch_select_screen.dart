@@ -1,3 +1,5 @@
+import 'dart:developer';
+
 import 'package:flutter/material.dart';
 import '../api_service.dart';
 import '../constants.dart';
@@ -28,6 +30,7 @@ class _BatchSelectScreenState extends State<BatchSelectScreen> {
     setState(() => isLoading = true);
     try {
       final data = await ApiService.get(kCameraBatches);
+      log('data: $data');
       if (data != null && data['data'] != null) {
         setState(() {
           batches = List<Map<String, dynamic>>.from(data['data']);
