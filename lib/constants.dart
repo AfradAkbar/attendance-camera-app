@@ -1,4 +1,4 @@
-const kBaseUrl = 'http://192.168.1.3:3000/api';
+const kBaseUrl = 'http://192.168.1.11:3000/api';
 
 const kCameraBatches = '$kBaseUrl/camera/batches';
 const kCameraBatchStudents =
